@@ -24,6 +24,7 @@
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
+-include("logger.hrl").
 
 -define(DICT, dict).
 
@@ -83,7 +84,7 @@ socket_type() ->
 %%          {stop, StopReason}
 %%----------------------------------------------------------------------
 init([{SockMod, Socket}, Opts]) ->
-    iconv:start(),
+    %iconv:start(),
     Access = case lists:keysearch(access, 1, Opts) of
 		 {value, {_, A}} -> A;
 		 _ -> all
@@ -93,12 +94,12 @@ init([{SockMod, Socket}, Opts]) ->
 		 _ -> none
 	     end,
     Host = case lists:keysearch(host, 1, Opts) of
-	       {value, {_, H}} -> H;
-	       _ -> ?MYNAME
+	       {value, {_, H}} -> iolist_to_binary([H]);
+	       _ -> iolist_to_binary([?MYNAME])
 	   end,
     MucHost = case lists:keysearch(muc_host, 1, Opts) of
-		  {value, {_, M}} -> M;
-		  _ -> "conference." ++ ?MYNAME
+		  {value, {_, M}} -> iolist_to_binary([M]);
+		  _ -> iolist_to_binary([<<"conference.">>,?MYNAME])
 	      end,
     Encoding = case lists:keysearch(encoding, 1, Opts) of
 		   {value, {_, E}} -> E;
@@ -133,7 +134,8 @@ init([{SockMod, Socket}, Opts]) ->
 			      }}.
 
 handle_info({tcp, _Socket, Line}, StateName, StateData) ->
-    DecodedLine = iconv:convert(StateData#state.encoding, "utf-8", Line),
+    %DecodedLine = iconv:convert(StateData#state.encoding, "utf-8", Line),
+    DecodedLine = Line,
     Parsed = parse_line(DecodedLine),
     ?MODULE:StateName({line, Parsed}, StateData);
 handle_info({tcp_closed, _}, _StateName, StateData) ->
@@ -154,16 +156,16 @@ handle_event(_Event, StateName, StateData) ->
 
 code_change(_OldVsn, StateName, StateData, _Extra) ->
     {ok, StateName, StateData}.
-terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
+terminate(Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
 				      sid = SID, host = Host, nick = Nick,
 				      joined = JoinedDict} = State) ->
-    ?INFO_MSG("closing IRC connection for ~p", [Nick]),
+    ?INFO_MSG("closing IRC connection for ~p: ~p", [Nick, Reason]),
     case SID of
 	none ->
 	    ok;
 	_ ->
-	    Packet = {xmlelement, "presence",
-		      [{"type", "unavailable"}], []},
+	    Packet = {xmlel, <<"presence">>,
+		      [{<<"type">>, <<"unavailable">>}], []},
 	    FromJID = user_jid(State),
 	    ?DICT:map(fun(ChannelJID, _ChannelData) ->
 			      ejabberd_router:route(FromJID, ChannelJID, Packet)
@@ -185,8 +187,10 @@ wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
     Nick = hd(Params),
     Pass = State#state.pass,
     Server = State#state.host,
+    ?DEBUG("user=~p server=~p", [Nick, Server]),
 
-    JID = jlib:make_jid(Nick, Server, "irc"),
+    JID = jlib:make_jid(list_to_binary(Nick), Server, <<"irc">>),
+    ?DEBUG("JID=~p", [JID]),
     case JID of
 	error ->
 	    ?DEBUG("invalid nick '~p'", [Nick]),
@@ -199,7 +203,7 @@ wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
 		    send_reply('ERR_NICKCOLLISION', [Nick, "Nickname collision"], State),
 		    {next_state, wait_for_nick, State};
 		allow ->
-		    case ejabberd_auth:check_password(Nick, Server, Pass) of
+		    case ejabberd_auth:check_password(list_to_binary(Nick), <<"">>, Server, list_to_binary(Pass)) of
 			false ->
 			    ?DEBUG("auth failed for '~p'", [Nick]),
 			    send_reply('ERR_NICKCOLLISION', [Nick, "Authentication failed"], State),
@@ -208,12 +212,15 @@ wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
 			    ?DEBUG("good nickname '~p'", [Nick]),
 			    SID = {now(), self()},
 			    ejabberd_sm:open_session(
-			      SID, Nick, Server, "irc", peerip(gen_tcp, State#state.socket)),
+			      SID, list_to_binary(Nick), Server, <<"irc">>, peerip(gen_tcp, State#state.socket)),
+			    ejabberd_sm:set_presence(SID, list_to_binary(Nick), Server, <<"irc">>,
+						     3, "undefined",
+						     [{'ip', peerip(gen_tcp, State#state.socket)}, {'conn','c2s'}, {'state',"+"}]),
 			    send_text_command("", "001", [Nick, "IRC interface of ejabberd server "++Server], State),
-			    send_reply('RPL_MOTDSTART', [Nick, "- "++Server++" Message of the day - "], State),
-			    send_reply('RPL_MOTD', [Nick, "- This is the IRC interface of the ejabberd server "++Server++"."], State),
-			    send_reply('RPL_MOTD', [Nick, "- Your full JID is "++Nick++"@"++Server++"/irc."], State),
-			    send_reply('RPL_MOTD', [Nick, "- Channel #whatever corresponds to MUC room whatever@"++State#state.muc_host++"."], State),
+			    send_reply('RPL_MOTDSTART', [Nick, "- "++binary_to_list(Server)++" Message of the day - "], State),
+			    send_reply('RPL_MOTD', [Nick, "- This is the IRC interface of the ejabberd server "++binary_to_list(Server)++"."], State),
+			    send_reply('RPL_MOTD', [Nick, "- Your full JID is "++Nick++"@"++binary_to_list(Server)++"/irc."], State),
+			    send_reply('RPL_MOTD', [Nick, "- Channel #whatever corresponds to MUC room whatever@"++binary_to_list(State#state.muc_host)++"."], State),
 			    send_reply('RPL_MOTD', [Nick, "- This IRC interface is quite immature.  You will probably find bugs."], State),
 			    send_reply('RPL_MOTD', [Nick, "- Have a good time!"], State),
 			    send_reply('RPL_ENDOFMOTD', [Nick, "End of /MOTD command"], State),
@@ -240,6 +247,7 @@ wait_for_cmd({line, #line{command = "USER", params = [_Username, _Hostname, _Ser
     %% Yeah, like we care.
     {next_state, wait_for_cmd, State};
 wait_for_cmd({line, #line{command = "JOIN", params = Params}}, State) ->
+    ?DEBUG("received JOIN ~p", [Params]),
     {ChannelsString, KeysString} =
 	case Params of
 	    [C, K] ->
@@ -249,8 +257,32 @@ wait_for_cmd({line, #line{command = "JOIN", params = Params}}, State) ->
 	end,
     Channels = string:tokens(ChannelsString, ","),
     Keys = string:tokens(KeysString, ","),
+    ?DEBUG("joining channels ~p", [Channels]),
     NewState = join_channels(Channels, Keys, State),
+    ?DEBUG("joined channels ~p", [Channels]),
     {next_state, wait_for_cmd, NewState};
+
+%% USERHOST command
+wait_for_cmd({line, #line{command = "USERHOST", params = Params}}, State) ->
+    case Params of
+        [] ->
+	    send_reply('ERR_NEEDMOREPARAMS', ["USERHOST", "Not enough parameters"], State);
+        UserParams ->
+	    Users = lists:sublist(string:tokens(UserParams, " "), 5), %% RFC 1459 specifies 5 items max
+	    lists:foreach(
+	      fun(UserSubList) ->
+		      User = lists:last(UserSubList),
+		      case ejabberd_sm:get_user_info(User, State#state.host, "irc") of
+			  offline ->
+			      send_reply('RPL_USERHOST',[State#state.nick, User++" offline"], State);
+			  [_Node, _Conn, Ip] ->
+			      {_,{{IP1,IP2,IP3,IP4}, _}} = Ip,
+			      send_reply('RPL_USERHOST',[State#state.nick, User ++ "=+" ++ integer_to_list(IP1) ++ "." ++
+							 integer_to_list(IP2) ++ "." ++ integer_to_list(IP3) ++ "." ++ integer_to_list(IP4)], State)
+		      end
+	      end, Users)
+    end,
+    {next_state, wait_for_cmd, State};
 
 wait_for_cmd({line, #line{command = "PART", params = [ChannelsString | MaybeMessage]}}, State) ->
     Message = case MaybeMessage of
@@ -268,18 +300,18 @@ wait_for_cmd({line, #line{command = "PRIVMSG", params = [To, Text]}}, State) ->
       fun(Rcpt) ->
 	      case Rcpt of
 		  [$# | Roomname] ->
-		      Packet = {xmlelement, "message",
-				[{"type", "groupchat"}],
-				[{xmlelement, "body", [],
+		      Packet = {xmlel, <<"message">>,
+				[{<<"type">>, <<"groupchat">>}],
+				[{xmlel, <<"body">>, [],
 				  filter_cdata(translate_action(Text))}]},
 		      ToJID = channel_to_jid(Roomname, State),
 		      ejabberd_router:route(FromJID, ToJID, Packet);
 		  _ ->
 		      case string:tokens(Rcpt, "#") of
 			  [Nick, Channel] ->
-			      Packet = {xmlelement, "message",
-					[{"type", "chat"}],
-					[{xmlelement, "body", [],
+			      Packet = {xmlel, <<"message">>,
+					[{<<"type">>, <<"chat">>}],
+					[{xmlel, <<"body">>, [],
 					  filter_cdata(translate_action(Text))}]},
 			      ToJID = channel_nick_to_jid(Nick, Channel, State),
 			      ejabberd_router:route(FromJID, ToJID, Packet);
@@ -331,9 +363,9 @@ wait_for_cmd({line, #line{command = "TOPIC", params = Params}}, State) ->
 	    end;
 	[Channel, NewTopic] ->
 	    Packet =
-		{xmlelement, "message",
-		 [{"type", "groupchat"}],
-		 [{xmlelement, "subject", [], filter_cdata(NewTopic)}]},
+		{xmlel, <<"message">>,
+		 [{<<"type">>, <<"groupchat">>}],
+		 [{xmlel, <<"subject">>, [], filter_cdata(NewTopic)}]},
 	    FromJID = user_jid(State),
 	    ToJID = channel_to_jid(Channel, State),
 	    ejabberd_router:route(FromJID, ToJID, Packet)
@@ -385,10 +417,11 @@ wait_for_cmd({line, #line{command = Unknown, params = Params} = Line}, State) ->
 				      Unknown ++ "/" ++ integer_to_list(length(Params))], State),
     {next_state, wait_for_cmd, State};
 
-wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, State) ->
-    Type = xml:get_attr_s("type", Attrs),
+wait_for_cmd({route, From, _To, {xmlel, <<"presence">>, Attrs, Els} = El}, State) ->
+    ?DEBUG("Received a Presence ~p ~p ~p", [From, _To, El]),
+    Type = fxml:get_attr_s(<<"type">>, Attrs),
     FromRoom = jlib:jid_remove_resource(From),
-    FromNick = From#jid.resource,
+    FromNick = binary_to_list(From#jid.resource),
 
     Channel = jid_to_channel(From, State),
     MyNick = State#state.nick,
@@ -396,24 +429,29 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 
     Joining = ?DICT:find(FromRoom, State#state.joining),
     Joined = ?DICT:find(FromRoom, State#state.joined),
+    ?DEBUG("JoinState ~p ~p ~p", [Joining, Joined, Type]),
     case {Joining, Joined, Type} of
-	{{ok, BufferedNicks}, _, ""} ->
+	{{ok, BufferedNicks}, _, <<"">>} ->
+            ?DEBUG("BufferedNicks ~p", [BufferedNicks]),
 	    case BufferedNicks of
 		[] ->
 		    %% If this is the first presence, tell the
 		    %% client that it's joining.
-		    send_command(make_irc_sender(MyNick, FromRoom, State),
-				 "JOIN", [Channel], State);
+                    ?DEBUG("Sending Command ~p ~p", [IRCSender, Channel]),
+		    send_command(IRCSender, "JOIN", [Channel], State),
+                    ?DEBUG("Command Sent", []);
 		_ ->
 		    ok
 	    end,
 
+            ?DEBUG("Getting NewRole", []),
 	    NewRole = case find_el("x", ?NS_MUC_USER, Els) of
 			  nothing ->
 			      "";
 			  XMucEl ->
-			      xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
+			      fxml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
 		      end,
+            ?DEBUG("NewRole ~p", [NewRole]),
 	    NewBufferedNicks = [{FromNick, NewRole} | BufferedNicks],
 	    ?DEBUG("~s is present in ~s.  we now have ~p.",
 		   [FromNick, Channel, NewBufferedNicks]),
@@ -453,14 +491,14 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 			State#state{joining = NewJoining}
 		end,
 	    {next_state, wait_for_cmd, NewState};
-	{{ok, _BufferedNicks}, _, "error"} ->
+	{{ok, _BufferedNicks}, _, <<"error">>} ->
 	    NewState =
 		case FromNick of
 		    MyNick ->
 			%% we couldn't join the room
 			{ReplyCode, ErrorDescription} =
-			    case xml:get_subtag(El, "error") of
-				{xmlelement, _, _, _} = ErrorEl ->
+			    case fxml:get_subtag(El, "error") of
+				{xmlel, _, _, _} = ErrorEl ->
 				    {ErrorName, ErrorText} = parse_error(ErrorEl),
 				    {case ErrorName of
 					 "forbidden" -> 'ERR_INVITEONLYCHAN';
@@ -485,7 +523,7 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 		end,
 	    {next_state, wait_for_cmd, NewState};
 	%% Presence in a channel we have already joined
-	{_, {ok, _}, ""} ->
+	{_, {ok, _}, <<"">>} ->
 	    %% Someone enters
 	    send_command(IRCSender, "JOIN", [Channel], State),
 	    {next_state, wait_for_cmd, State};
@@ -498,29 +536,37 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 	    {next_state, wait_for_cmd, State}
     end;
 
-wait_for_cmd({route, From, _To, {xmlelement, "message", Attrs, Els} = El}, State) ->
-    Type = xml:get_attr_s("type", Attrs),
+wait_for_cmd({route, From, _To, {xmlel, <<"message">>, Attrs, Els} = El}, State) ->
+    ?DEBUG("Got a Message! ~p ~p ~p", [From, _To, El]),
+    Type = fxml:get_attr_s(<<"type">>, Attrs),
     case Type of
-	"groupchat" ->
+	<<"groupchat">> ->
+            ?DEBUG("It's a groupchat", []),
 	    ChannelJID = jlib:jid_remove_resource(From),
 	    case ?DICT:find(ChannelJID, State#state.joined) of
 		{ok, #channel{} = ChannelData} ->
 		    FromChannel = jid_to_channel(From, State),
-		    FromNick = From#jid.resource,
-		    Subject = xml:get_path_s(El, [{elem, "subject"}, cdata]),
-		    Body = xml:get_path_s(El, [{elem, "body"}, cdata]),
-		    XDelay = lists:any(fun({xmlelement, "x", XAttrs, _}) ->
-					       xml:get_attr_s("xmlns", XAttrs) == ?NS_DELAY;
+		    FromNick = binary_to_list(From#jid.resource),
+		    Subject = fxml:get_path_s(El, [{elem, <<"subject">>}, cdata]),
+		    Body = fxml:get_path_s(El, [{elem, <<"body">>}, cdata]),
+                    ?DEBUG("Message Data ~p ~p", [Subject, Body]),
+		    XDelay = lists:any(fun({xmlel, <<"x">>, XAttrs, _}) ->
+					       fxml:get_attr_s(<<"xmlns">>, XAttrs) == ?NS_DELAY;
 					  (_) ->
 					       false
 				       end, Els),
+                    ?DEBUG("XDelay ~p", [XDelay]),
 		    if
-			Subject /= "" ->
+			Subject /= <<"">> ->
+                            ?DEBUG("Cleaning Subject!", []),
 			    CleanSubject = lists:map(fun($\n) ->
 							     $\ ;
 							(C) -> C
-						     end, Subject),
-			    send_text_command(make_irc_sender(From, State),
+						     end, binary_to_list(Subject)),
+                            ?DEBUG("CleanSubject ~p", [CleanSubject]),
+                            IRCSender = make_irc_sender(From, State),
+                            ?DEBUG("IRCSender ~p", [IRCSender]),
+			    send_text_command(IRCSender,
 					      "TOPIC", [FromChannel, CleanSubject], State),
 			    NewChannelData = ChannelData#channel{topic = CleanSubject},
 			    NewState = State#state{joined = ?DICT:store(jlib:jid_remove_resource(From), NewChannelData, State#state.joined)},
@@ -528,9 +574,11 @@ wait_for_cmd({route, From, _To, {xmlelement, "message", Attrs, Els} = El}, State
 			not XDelay, FromNick == State#state.nick ->
 			    %% there is no message echo in IRC.
 			    %% we let the backlog through, though.
+                            ?DEBUG("Don't care about it", []),
 			    {next_state, wait_for_cmd, State};
 			true ->
-			    BodyLines = string:tokens(Body, "\n"),
+                            ?DEBUG("Send it to someone!", []),
+			    BodyLines = string:tokens(binary_to_list(Body), "\n"),
 			    lists:foreach(
 			      fun(Line) ->
 				      Line1 =
@@ -550,7 +598,7 @@ wait_for_cmd({route, From, _To, {xmlelement, "message", Attrs, Els} = El}, State
 			       [jlib:jid_to_string(ChannelJID)]),
 		    {next_state, wait_for_cmd, State}
 	    end;
-	"error" ->
+	<<"error">> ->
 	    MucHost = State#state.muc_host,
 	    ErrorFrom =
 		case From of
@@ -569,7 +617,7 @@ wait_for_cmd({route, From, _To, {xmlelement, "message", Attrs, Els} = El}, State
 	    %% I think this should cover all possible combinations of
 	    %% XMPP and non-XMPP error messages...
 	    ErrorText =
-		error_to_string(xml:get_subtag(El, "error")),
+		error_to_string(fxml:get_subtag(El, <<"error">>)),
 	    send_text_command("", "NOTICE", [State#state.nick,
 					     "Message to "++ErrorFrom++" bounced: "++
 					     ErrorText], State),
@@ -578,8 +626,8 @@ wait_for_cmd({route, From, _To, {xmlelement, "message", Attrs, Els} = El}, State
 	    ChannelJID = jlib:jid_remove_resource(From),
 	    case ?DICT:find(ChannelJID, State#state.joined) of
 		{ok, #channel{}} ->
-		    FromNick = From#jid.lresource++jid_to_channel(From, State),
-		    Body = xml:get_path_s(El, [{elem, "body"}, cdata]),
+		    FromNick = binary_to_list(From#jid.lresource)++jid_to_channel(From, State),
+		    Body = fxml:get_path_s(El, [{elem, <<"body">>}, cdata]),
 		    BodyLines = string:tokens(Body, "\n"),
 		    lists:foreach(
 		      fun(Line) ->
@@ -610,30 +658,36 @@ join_channels(Channels, [], State) ->
 join_channels([Channel | Channels], [Key | Keys],
 	      #state{nick = Nick} = State) ->
     Packet =
-	{xmlelement, "presence", [],
-	 [{xmlelement, "x", [{"xmlns", ?NS_MUC}],
+	{xmlel, <<"presence">>, [],
+	 [{xmlel, <<"x">>, [{<<"xmlns">>, ?NS_MUC}],
 	   case Key of
 	       none ->
 		   [];
 	       _ ->
-		   [{xmlelement, "password", [], filter_cdata(Key)}]
+		   [{xmlel, <<"password">>, [], filter_cdata(Key)}]
 	   end}]},
+    ?DEBUG("joining channel nick=~p channel=~p state=~p", [Nick, Channel, State]),
     From = user_jid(State),
+    ?DEBUG("1 ~p", [From]),
     To = channel_nick_to_jid(Nick, Channel, State),
+    ?DEBUG("2 ~p", [To]),
     Room = jlib:jid_remove_resource(To),
+    ?DEBUG("3 ~p", [Room]),
     ejabberd_router:route(From, To, Packet),
+    ?DEBUG("4", []),
     NewState = State#state{joining = ?DICT:store(Room, [], State#state.joining)},
+    ?DEBUG("5 ~p", [NewState]),
     join_channels(Channels, Keys, NewState).
 
 part_channels([], State, _Message) ->
     State;
 part_channels([Channel | Channels], State, Message) ->
     Packet =
-	{xmlelement, "presence",
-	 [{"type", "unavailable"}],
+	{xmlel, <<"presence">>,
+	 [{<<"type">>, <<"unavailable">>}],
 	 case Message of
 	    nothing -> [];
-	    _ -> [{xmlelement, "status", [],
+	    _ -> [{xmlel, <<"status">>, [],
 		  [{xmlcdata, Message}]}]
 	 end},
     From = user_jid(State),
@@ -678,7 +732,8 @@ upcase([C|String]) ->
 send_line(Line, #state{sockmod = SockMod, socket = Socket, encoding = Encoding}) ->
     ?DEBUG("sending ~s", [Line]),
     gen_tcp = SockMod,
-    EncodedLine = iconv:convert("utf-8", Encoding, Line),
+    %EncodedLine = iconv:convert("utf-8", Encoding, Line),
+    EncodedLine = Line,
     ok = gen_tcp:send(Socket, [EncodedLine, 13, 10]).
 
 send_command(Sender, Command, Params, State) ->
@@ -690,9 +745,10 @@ send_text_command(Sender, Command, Params, State) ->
     send_command(Sender, Command, Params, State, true).
 
 send_command(Sender, Command, Params, State, AlwaysQuote) ->
+    ?DEBUG("SendCommand ~p ~p ~p", [Sender, Command, Params]),
     Prefix = case Sender of
 		 "" ->
-		     [$: | State#state.host];
+		     [$: | binary_to_list(State#state.host)];
 		 _ ->
 		     [$: | Sender]
 	     end,
@@ -741,6 +797,8 @@ send_reply(Reply, Params, State) ->
     send_text_command("", Number, Params, State).
 
 make_param_string([], _) -> "";
+make_param_string([LastParam], AlwaysQuote) when is_binary(LastParam) ->
+    make_param_string([binary_to_list(LastParam)], AlwaysQuote);
 make_param_string([LastParam], AlwaysQuote) ->
     case {AlwaysQuote, LastParam, lists:member($\ , LastParam)} of
 	{true, _, _} ->
@@ -752,14 +810,16 @@ make_param_string([LastParam], AlwaysQuote) ->
 	{_, _, _} ->
 	    " " ++ LastParam
     end;
-make_param_string([Param | Params], AlwaysQuote) ->
+make_param_string([Param | Params], AlwaysQuote) when is_list(Param) ->
     case lists:member($\ , Param) of
 	false ->
 	    " " ++ Param ++ make_param_string(Params, AlwaysQuote)
-    end.
+    end;
+make_param_string([Param | Params], AlwaysQuote) when is_binary(Param) ->
+    make_param_string([binary_to_list(Param) | Params], AlwaysQuote).
 
-find_el(Name, NS, [{xmlelement, N, Attrs, _} = El|Els]) ->
-    XMLNS = xml:get_attr_s("xmlns", Attrs),
+find_el(Name, NS, [{xmlel, N, Attrs, _} = El|Els]) ->
+    XMLNS = fxml:get_attr_s("xmlns", Attrs),
     case {Name, NS} of
 	{N, XMLNS} ->
 	    El;
@@ -775,7 +835,7 @@ channel_to_jid(Channel, #state{muc_host = MucHost,
 			       channels_to_jids = ChannelsToJids}) ->
     case ?DICT:find(Channel, ChannelsToJids) of
 	{ok, RoomJID} -> RoomJID;
-	_ -> jlib:make_jid(Channel, MucHost, "")
+	_ -> jlib:make_jid(list_to_binary(Channel), MucHost, <<"">>)
     end.
 
 channel_nick_to_jid(Nick, [$#|Channel], State) ->
@@ -783,28 +843,28 @@ channel_nick_to_jid(Nick, [$#|Channel], State) ->
 channel_nick_to_jid(Nick, Channel, #state{muc_host = MucHost,
 					 channels_to_jids = ChannelsToJids}) ->
     case ?DICT:find(Channel, ChannelsToJids) of
-	{ok, RoomJID} -> jlib:jid_replace_resource(RoomJID, Nick);
-	_ -> jlib:make_jid(Channel, MucHost, Nick)
+	{ok, RoomJID} -> jlib:jid_replace_resource(RoomJID, list_to_binary(Nick));
+	_ -> jlib:make_jid(list_to_binary(Channel), MucHost, list_to_binary(Nick))
     end.
 
 jid_to_channel(#jid{user = Room} = RoomJID,
 	       #state{jids_to_channels = JidsToChannels}) ->
     case ?DICT:find(jlib:jid_remove_resource(RoomJID), JidsToChannels) of
-	{ok, Channel} -> [$#|Channel];
-	_ -> [$#|Room]
+	{ok, Channel} -> [$#|binary_to_list(Channel)];
+	_ -> [$#|binary_to_list(Room)]
     end.
 
 make_irc_sender(Nick, #jid{luser = Room} = RoomJID,
 		#state{jids_to_channels = JidsToChannels}) ->
     case ?DICT:find(jlib:jid_remove_resource(RoomJID), JidsToChannels) of
-	{ok, Channel} -> Nick++"!"++Nick++"@"++Channel;
-	_ -> Nick++"!"++Nick++"@"++Room
+	{ok, Channel} -> Nick++"!"++Nick++"@"++binary_to_list(Channel);
+	_ -> Nick++"!"++Nick++"@"++binary_to_list(Room)
     end.
 make_irc_sender(#jid{lresource = Nick} = JID, State) ->
-    make_irc_sender(Nick, JID, State).
+    make_irc_sender(binary_to_list(Nick), JID, State).
 
 user_jid(#state{nick = Nick, host = Host}) ->
-    jlib:make_jid(Nick, Host, "irc").
+    jlib:make_jid(list_to_binary(Nick), Host, <<"irc">>).
 
 filter_cdata(Msg) ->
     [{xmlcdata, filter_message(Msg)}].
@@ -813,7 +873,8 @@ filter_message(Msg) ->
     lists:filter(
       fun(C) ->
 	      if (C < 32) and
-		 (C /= 3) and
+		 %% Add color support, but break XML: (see https://support.process-one.net/browse/EJAB-1097 )
+		 %% (C /= 3) and
 		 (C /= 9) and
 		 (C /= 10) and
 		 (C /= 13) ->
@@ -830,25 +891,25 @@ translate_action(Msg) ->
 	    Msg
     end.
 
-parse_error({xmlelement, "error", _ErrorAttrs, ErrorEls} = ErrorEl) ->
-    ErrorTextEl = xml:get_subtag(ErrorEl, "text"),
+parse_error({xmlel, "error", _ErrorAttrs, ErrorEls} = ErrorEl) ->
+    ErrorTextEl = fxml:get_subtag(ErrorEl, "text"),
     ErrorName =
 	case ErrorEls -- [ErrorTextEl] of
-	    [{xmlelement, ErrorReason, _, _}] ->
+	    [{xmlel, ErrorReason, _, _}] ->
 		ErrorReason;
 	    _ ->
 		"unknown error"
 	end,
     ErrorText =
 	case ErrorTextEl of
-	    {xmlelement, _, _, _} ->
-		xml:get_tag_cdata(ErrorTextEl);
+	    {xmlel, _, _, _} ->
+		fxml:get_tag_cdata(ErrorTextEl);
 	    _ ->
 		nothing
     end,
     {ErrorName, ErrorText}.
 
-error_to_string({xmlelement, "error", _ErrorAttrs, _ErrorEls} = ErrorEl) ->
+error_to_string({xmlel, "error", _ErrorAttrs, _ErrorEls} = ErrorEl) ->
     case parse_error(ErrorEl) of
 	{ErrorName, ErrorText} when is_list(ErrorText) ->
 	    ErrorName ++ ": " ++ ErrorText;
